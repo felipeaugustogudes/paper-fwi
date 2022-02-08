@@ -1,0 +1,170 @@
+from collections.abc import Iterable
+from operator import attrgetter
+
+from sympy import sympify
+
+from devito.symbolics import (retrieve_functions, retrieve_indexed, split_affine,
+                              uxreplace)
+from devito.tools import PartialOrderTuple, filter_sorted, flatten, as_tuple
+from devito.types import Dimension, Eq, IgnoreDimSort
+
+__all__ = ['dimension_sort', 'generate_implicit_exprs', 'lower_exprs']
+
+
+def dimension_sort(expr):
+    """
+    Topologically sort the Dimensions in ``expr``, based on the order in which they
+    appear within Indexeds.
+    """
+
+    def handle_indexed(indexed):
+        relation = []
+        for i in indexed.indices:
+            try:
+                maybe_dim = split_affine(i).var
+                if isinstance(maybe_dim, Dimension):
+                    relation.append(maybe_dim)
+            except ValueError:
+                # Maybe there are some nested Indexeds (e.g., the situation is A[B[i]])
+                nested = flatten(handle_indexed(n) for n in retrieve_indexed(i))
+                if nested:
+                    relation.extend(nested)
+                else:
+                    # Fallback: Just insert all the Dimensions we find, regardless of
+                    # what the user is attempting to do
+                    relation.extend([d for d in filter_sorted(i.free_symbols)
+                                     if isinstance(d, Dimension)])
+        return tuple(relation)
+
+    if isinstance(expr.implicit_dims, IgnoreDimSort):
+        relations = set()
+    else:
+        relations = {handle_indexed(i) for i in retrieve_indexed(expr)}
+
+    # Add in any implicit dimension (typical of scalar temporaries, or Step)
+    relations.add(expr.implicit_dims)
+
+    # Add in leftover free dimensions (not an Indexed' index)
+    extra = set([i for i in expr.free_symbols if isinstance(i, Dimension)])
+
+    # Add in pure data dimensions (e.g., those accessed only via explicit values,
+    # such as A[3])
+    indexeds = retrieve_indexed(expr, deep=True)
+    extra.update(set().union(*[set(i.function.dimensions) for i in indexeds]))
+
+    # Enforce determinism
+    extra = filter_sorted(extra, key=attrgetter('name'))
+
+    # Add in implicit relations for parent dimensions
+    # -----------------------------------------------
+    # 1) Note that (d.parent, d) is what we want, while (d, d.parent) would be
+    # wrong; for example, in `((t, time), (t, x, y), (x, y))`, `x` could now
+    # preceed `time`, while `t`, and therefore `time`, *must* appear before `x`,
+    # as indicated by the second relation
+    implicit_relations = {(d.parent, d) for d in extra if d.is_Derived}
+    # 2) To handle cases such as `((time, xi), (x,))`, where `xi` a SubDimension
+    # of `x`, besides `(x, xi)`, we also have to add `(time, x)` so that we
+    # obtain the desired ordering `(time, x, xi)`. W/o `(time, x)`, the ordering
+    # `(x, time, xi)` might be returned instead, which would be non-sense
+    implicit_relations.update({tuple(d.root for d in i) for i in relations})
+
+    ordering = PartialOrderTuple(extra, relations=(relations | implicit_relations))
+
+    return ordering
+
+
+def generate_implicit_exprs(expressions):
+    """
+    Create and add implicit expressions.
+
+    Implicit expressions are those not explicitly defined by the user
+    but instead are requisites of some specified functionality.
+
+    Currently, implicit expressions stem from the following:
+
+        * MultiSubDomains attached to input equations.
+    """
+    found = {}
+    processed = []
+    for e in expressions:
+        if e.subdomain:
+            try:
+                dims = [d.root for d in e.free_symbols if isinstance(d, Dimension)]
+                sub_dims = [d.root for d in e.subdomain.dimensions]
+                sub_dims.extend(e.subdomain.implicit_dimensions)
+                dims = [d for d in dims if d not in frozenset(sub_dims)]
+                dims.extend(e.subdomain.implicit_dimensions)
+                if e.subdomain not in found:
+                    grid = list(retrieve_functions(e, mode='unique'))[0].grid
+                    found[e.subdomain] = [i.func(*i.args, implicit_dims=dims) for i in
+                                          e.subdomain._create_implicit_exprs(grid)]
+                processed.extend(found[e.subdomain])
+                dims.extend(e.subdomain.dimensions)
+                new_e = Eq(e.lhs, e.rhs, subdomain=e.subdomain, implicit_dims=dims)
+                processed.append(new_e)
+            except AttributeError:
+                # Not a MultiSubDomain
+                processed.append(e)
+        else:
+            processed.append(e)
+    return processed
+
+
+def lower_exprs(expressions, **kwargs):
+    """
+    Lowering an expression consists of the following passes:
+
+        * Indexify functions;
+        * Align Indexeds with the computational domain;
+        * Apply user-provided substitution;
+
+    Examples
+    --------
+    f(x - 2*h_x, y) -> f[xi + 2, yi + 4]  (assuming halo_size=4)
+    """
+    # Normalize subs
+    subs = {k: sympify(v) for k, v in kwargs.get('subs', {}).items()}
+
+    processed = []
+    for expr in as_tuple(expressions):
+        try:
+            dimension_map = expr.subdomain.dimension_map
+        except AttributeError:
+            # Some Relationals may be pure SymPy objects, thus lacking the subdomain
+            dimension_map = {}
+
+        # Handle Functions (typical case)
+        mapper = {f: lower_exprs(f.indexify(subs=dimension_map), **kwargs)
+                  for f in retrieve_functions(expr)}
+
+        # Handle Indexeds (from index notation)
+        for i in retrieve_indexed(expr):
+            f = i.function
+
+            # Introduce shifting to align with the computational domain
+            indices = [(lower_exprs(a) + o) for a, o in
+                       zip(i.indices, f._size_nodomain.left)]
+
+            # Substitute spacing (spacing only used in own dimension)
+            indices = [i.xreplace({d.spacing: 1, -d.spacing: -1})
+                       for i, d in zip(indices, f.dimensions)]
+
+            # Apply substitutions, if necessary
+            if dimension_map:
+                indices = [j.xreplace(dimension_map) for j in indices]
+
+            mapper[i] = f.indexed[indices]
+
+        # Add dimensions map to the mapper in case dimensions are used
+        # as an expression, i.e. Eq(u, x, subdomain=xleft)
+        mapper.update(dimension_map)
+        # Add the user-supplied substitutions
+        mapper.update(subs)
+        # Apply mapper to expression
+        processed.append(uxreplace(expr, mapper))
+
+    if isinstance(expressions, Iterable):
+        return processed
+    else:
+        assert len(processed) == 1
+        return processed.pop()
